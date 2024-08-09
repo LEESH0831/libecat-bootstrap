@@ -1,15 +1,47 @@
-# -*- coding: utf-8 -*-
-
 import sys
 import os
-from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QVBoxLayout, QLabel, QPushButton, QDial, QLineEdit, QGraphicsView, QGraphicsScene, QFrame
-from PyQt5.QtCore import Qt, QSize
+import socket
+import threading
+from PyQt5.QtWidgets import QApplication, QWidget, QGridLayout, QVBoxLayout, QLabel, QPushButton, QDial, QLineEdit, QGraphicsView, QGraphicsScene, QFrame, QDialog
+from PyQt5.QtCore import Qt, QSize, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon, QPixmap
+
+class ConnectionDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("Connection")
+        layout = QVBoxLayout()
+
+        self.ip_input = QLineEdit(self)
+        self.ip_input.setPlaceholderText("IP Address")
+        layout.addWidget(self.ip_input)
+
+        self.port_input = QLineEdit(self)
+        self.port_input.setPlaceholderText("Port")
+        layout.addWidget(self.port_input)
+
+        connect_button = QPushButton("Connect", self)
+        connect_button.clicked.connect(self.accept)
+        layout.addWidget(connect_button)
+
+        self.setLayout(layout)
+
+    def get_connection_info(self):
+        return self.ip_input.text(), self.port_input.text()
+
+class SocketSignals(QObject):
+    receivedData = pyqtSignal(str)
 
 class SkeletonPanel(QWidget):
     def __init__(self):
         super().__init__()
         self.initUI()
+        self.socket = None
+        self.signals = SocketSignals()
+        self.signals.receivedData.connect(self.handle_received_data)
 
     def initUI(self):
         self.setWindowTitle('Skeleton Panel')
@@ -103,8 +135,8 @@ class SkeletonPanel(QWidget):
         start_button.clicked.connect(self.start_robot)
         stop_button.clicked.connect(self.stop_robot)
 
-        right_layout.addWidget(start_button, 0, 0, 1, 1)  # Start 버튼 추가
-        right_layout.addWidget(stop_button, 0, 1, 1, 1)  # Stop 버튼 추가
+        right_layout.addWidget(start_button, 0, 0, 1, 1)
+        right_layout.addWidget(stop_button, 0, 1, 1, 1)
 
         # Speed control buttons and input field
         button_layout = QGridLayout()
@@ -148,6 +180,16 @@ class SkeletonPanel(QWidget):
 
         right_layout.addLayout(button_layout, 3, 0, 1, 2)
 
+        # Add Send All Wheel Positions button
+        self.send_button = QPushButton("Send All Wheel Positions", self)
+        self.send_button.clicked.connect(self.send_all_wheel_positions)
+        right_layout.addWidget(self.send_button, 5, 0, 1, 2)
+
+        # Connection button
+        self.connect_button = QPushButton("Connection", self)
+        self.connect_button.clicked.connect(self.show_connection_dialog)
+        right_layout.addWidget(self.connect_button, 4, 0, 1, 2)
+
         # Add frames to the main layout
         layout.addWidget(camera_frame, 0, 0)
         layout.addWidget(speed_angle_frame, 1, 0)
@@ -157,23 +199,67 @@ class SkeletonPanel(QWidget):
 
         self.show()
 
-    # Adds a dial and angle input field for controlling wheel direction
+    def show_connection_dialog(self):
+        dialog = ConnectionDialog(self)
+        if dialog.exec_():
+            ip, port = dialog.get_connection_info()
+            self.connect_to_server(ip, port)
+
+    def connect_to_server(self, ip, port):
+        try:
+            port = int(port)
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((ip, port))
+            print(f"Connected to {ip}:{port}")
+            self.connect_button.setText("Connected")
+            self.connect_button.setEnabled(False)
+            threading.Thread(target=self.receive_data, daemon=True).start()
+        except Exception as e:
+            print(f"Connection failed: {e}")
+
+    def receive_data(self):
+        while True:
+            try:
+                data = self.socket.recv(1024)
+                if not data:
+                    break
+                message = data.decode()
+                self.signals.receivedData.emit(message)
+            except:
+                break
+        print("Disconnected from server")
+
+    def handle_received_data(self, data):
+        print(f"Received: {data}")
+
+    def send_command(self, command):
+        if self.socket:
+            try:
+                self.socket.sendall(command.encode())
+                print(f"Sent command: {command}")
+            except:
+                print("Failed to send command")
+        else:
+            print("Not connected to server")
+
     def add_wheel_control(self, layout, row, col, wheel_index, include_speed_buttons=True):
         dial = QDial(self)
         dial.setNotchesVisible(True)
-        dial.setWrapping(True)  # Enable 360-degree rotation
-        dial.setMinimum(0)
-        dial.setMaximum(8)  # Divide the dial into 8 steps, each representing 45 degrees
+        dial.setWrapping(False)  # Disable 360-degree rotation
+        dial.setMinimum(-4)  # -200000 / 50000 = -4
+        dial.setMaximum(4)   # 200000 / 50000 = 4
+        dial.setSingleStep(1)
+        dial.setPageStep(1)
 
         # Connect the dial's value change to update the angle display
-        dial.valueChanged.connect(lambda value, idx=wheel_index: self.update_wheel_angle(idx, value * 45))
+        dial.valueChanged.connect(lambda value, idx=wheel_index: self.update_wheel_angle(idx, value * 50000))
         
         # Input field for entering the angle value manually
         angle_input = QLineEdit(self)
-        angle_input.setFixedSize(60, 30)
+        angle_input.setFixedSize(80, 30)
         angle_input.setStyleSheet("font-size: 16px;")
         angle_input.setAlignment(Qt.AlignCenter)
-        angle_input.setPlaceholderText("Angle")
+        angle_input.setPlaceholderText("Position")
         angle_input.returnPressed.connect(lambda idx=wheel_index, input=angle_input: self.set_wheel_angle(idx, input))
 
         # Layout to hold the dial and the input field
@@ -184,26 +270,40 @@ class SkeletonPanel(QWidget):
         # Add the wheel control layout to the specified position in the main layout
         layout.addLayout(wheel_layout, row, col, Qt.AlignCenter)
 
-    # Updates the angle display for the specified wheel
     def update_wheel_angle(self, wheel_index, value):
-        if value == 360:
-            value = 0
         angle_label, angle_value_label = self.wheel_labels[wheel_index]
         angle_value_label.setText(str(value))
 
-    # Sets the wheel angle based on user input
+        # Send command to move the actual robot wheel
+        command = f"send\n{wheel_index} tmo {value}\nsend\n"
+        self.send_command(command)
+
     def set_wheel_angle(self, wheel_index, input_field):
         try:
             value = int(input_field.text())
-            if 0 <= value <= 359:
+            if -200000 <= value <= 200000 and value % 50000 == 0:
                 self.wheel_labels[wheel_index][1].setText(str(value))
                 input_field.clear()
+
+                # Send command to move the actual robot wheel
+                command = f"send\n{wheel_index} tmo {value}\nsend\n"
+                self.send_command(command)
+
+                # Update dial position
+                dial = self.findChild(QDial, f"dial_{wheel_index}")
+                if dial:
+                    dial.setValue(value // 50000)
             else:
                 input_field.setText("Invalid")
         except ValueError:
             input_field.setText("Error")
 
-    # Adjusts the speed of all wheels by a given delta value
+    def send_all_wheel_positions(self):
+        for i in range(4):
+            value = int(self.wheel_labels[i][1].text())
+            command = f"send\n{i} tmo {value}\nsend\n"
+            self.send_command(command)
+
     def change_all_wheel_speeds(self, delta):
         speed_text = self.speed_label.text()
         if ": " in speed_text:
@@ -214,7 +314,6 @@ class SkeletonPanel(QWidget):
             except ValueError:
                 pass
 
-    # Sets the speed value based on user input
     def set_speed(self, input_field):
         try:
             value = int(input_field.text())
@@ -223,17 +322,14 @@ class SkeletonPanel(QWidget):
         except ValueError:
             input_field.setText("Error")
 
-    # Start the robot with speed 1500000 and reset wheel angles to 0
     def start_robot(self):
         self.speed_label.setText('Speed: 1500000')
         for angle_label, angle_value_label in self.wheel_labels:
             angle_value_label.setText('0')
 
-    # Stop the robot by setting speed to 0 and keeping current wheel angles
     def stop_robot(self):
         self.speed_label.setText('Speed: 0')
 
-    # Resizes the background image to fit the window size
     def resizeEvent(self, event):
         self.background.setGeometry(0, 0, self.width(), self.height())
         self.bg_image = QPixmap(self.image_path).scaled(self.width(), self.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
